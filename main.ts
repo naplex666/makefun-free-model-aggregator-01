@@ -45,7 +45,6 @@ const brief = readBrief(PROMPT_FILE);
 let probes: Probe[] = [];
 let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
-const exhaustedProviders = new Set<string>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -79,11 +78,11 @@ interface Route {
   rating: number;
 }
 
-function getCandidateRoutes(requires: Requirement): Route[] {
+function getCandidateRoutes(requires: Requirement, excludeProviders: ReadonlySet<string> = new Set()): Route[] {
   const candidates: Route[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
-    if (exhaustedProviders.has(probe.provider.id)) continue;
+    if (excludeProviders.has(probe.provider.id)) continue;
     for (const model of probe.models) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, row)) continue;
@@ -182,7 +181,7 @@ async function callProviderAndTranslate(
       upstreamBody = { ...body, model: route.model.id };
     } else if (wire === 'openai') {
       url = `${base}/v1/chat/completions`;
-      upstreamBody = anthropicToOpenAI(body, route.model.id);
+      upstreamBody = { ...anthropicToOpenAI(body, route.model.id), ...(body.stream === true ? { stream_options: { include_usage: true } } : {}) };
     } else if (wire === 'gemini') {
       const openAiReq = anthropicToOpenAI(body, route.model.id);
       url = `${base}/v1beta/models/${route.model.id}:${body.stream === true ? 'streamGenerateContent?alt=sse' : 'generateContent'}`;
@@ -193,7 +192,7 @@ async function callProviderAndTranslate(
     // Client sent OpenAI /v1/chat/completions request
     if (wire === 'openai') {
       url = `${base}/v1/chat/completions`;
-      upstreamBody = { ...body, model: route.model.id };
+      upstreamBody = { ...body, model: route.model.id, ...(body.stream === true ? { stream_options: { include_usage: true } } : {}) };
     } else if (wire === 'anthropic') {
       url = `${base}/v1/messages`;
       upstreamBody = openAItoAnthropicRequest(body, route.model.id);
@@ -207,12 +206,10 @@ async function callProviderAndTranslate(
   try {
     const upstream = await fetch(url, { method: 'POST', headers, body: JSON.stringify(upstreamBody) });
     if (upstream.status === 402 || upstream.status === 429 || upstream.status >= 500) {
-      exhaustedProviders.add(route.probe.provider.id);
       return null;
     }
     return { upstream, translatedBody: upstreamBody, wire };
   } catch {
-    exhaustedProviders.add(route.probe.provider.id);
     return null;
   }
 }
@@ -226,15 +223,18 @@ async function handleChatOrMessages(req: IncomingMessage, res: ServerResponse, i
   const requestedModel = typeof body.model === 'string' && body.model !== '' ? body.model : 'default';
 
   let successResult: { upstream: Response; wire: string; route: Route } | null = null;
+  const failedThisRequest = new Set<string>();
 
   while (true) {
-    const candidates = getCandidateRoutes(requires);
+    const candidates = getCandidateRoutes(requires, failedThisRequest);
     if (candidates.length === 0) break;
     const route = candidates[0];
     const result = await callProviderAndTranslate(route, body, isAnthropicClient);
     if (result !== null) {
       successResult = { upstream: result.upstream, wire: result.wire, route };
       break;
+    } else {
+      failedThisRequest.add(route.probe.provider.id);
     }
   }
 

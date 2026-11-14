@@ -853,6 +853,7 @@ export async function* anthropicEventsToOpenAIStream(upstream: ReadableStream<Ui
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let inputTokens = 0;
 
   const sendChunk = (delta: Json, finishReason: string | null = null, usage: Json | null = null) => {
     const chunk: Json = {
@@ -882,7 +883,11 @@ export async function* anthropicEventsToOpenAIStream(upstream: ReadableStream<Ui
             const parsed = JSON.parse(dataLine.slice(6));
             if (isRecord(parsed)) {
               const type = parsed.type;
-              if (type === 'content_block_delta') {
+              if (type === 'message_start') {
+                const msg = isRecord(parsed.message) ? parsed.message : {};
+                const usageObj = isRecord(msg.usage) ? msg.usage : {};
+                inputTokens = numberOrZero(usageObj.input_tokens);
+              } else if (type === 'content_block_delta') {
                 const deltaObj = isRecord(parsed.delta) ? parsed.delta : {};
                 if (deltaObj.type === 'text_delta' && typeof deltaObj.text === 'string') {
                   yield sendChunk({ content: deltaObj.text });
@@ -894,8 +899,8 @@ export async function* anthropicEventsToOpenAIStream(upstream: ReadableStream<Ui
                 const stopReason = typeof deltaObj.stop_reason === 'string' ? deltaObj.stop_reason : 'end_turn';
                 const mappedStop = stopReason === 'max_tokens' ? 'length' : stopReason === 'tool_use' ? 'tool_calls' : 'stop';
                 const usageObj = isRecord(parsed.usage) ? parsed.usage : {};
-                const outputTokens = numberOrZero(usageObj.output_tokens);
-                yield sendChunk({}, mappedStop, { completion_tokens: outputTokens, prompt_tokens: 0, total_tokens: outputTokens });
+                const outputTokens = numberOrZero(usageObj.usage?.output_tokens ?? usageObj.output_tokens);
+                yield sendChunk({}, mappedStop, { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens });
               }
             }
           } catch {}
