@@ -139,11 +139,20 @@ async function readJson(req: IncomingMessage): Promise<Json | null> {
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
   res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
   res.end(text);
 }
 
 function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string): void {
+  if (res.headersSent) {
+    log('sendError after headers sent; ending response as-is');
+    res.end();
+    return;
+  }
   if (wire === 'anthropic') sendJson(res, status, anthropicError(type, message));
   else sendJson(res, status, openAIError(message, type, null));
 }
@@ -208,6 +217,9 @@ async function callProviderAndTranslate(
     if (upstream.status === 402 || upstream.status === 429 || upstream.status >= 500) {
       return null;
     }
+    if (body.stream === true && (upstream.body === null || typeof upstream.body.getReader !== 'function')) {
+      return null;
+    }
     return { upstream, translatedBody: upstreamBody, wire };
   } catch {
     return null;
@@ -249,7 +261,7 @@ async function handleChatOrMessages(req: IncomingMessage, res: ServerResponse, i
   if (isAnthropicClient) {
     if (isStreaming) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      if (wire === 'anthropic' && upstream.body !== null) {
+      if (wire === 'anthropic' && upstream.body !== null && typeof upstream.body.getReader === 'function') {
         const reader = upstream.body.getReader();
         try {
           for (;;) {
@@ -260,13 +272,23 @@ async function handleChatOrMessages(req: IncomingMessage, res: ServerResponse, i
         } finally {
           reader.releaseLock();
         }
-      } else if (wire === 'openai' && upstream.body !== null) {
+      } else if (wire === 'openai' && upstream.body !== null && typeof upstream.body.getReader === 'function') {
         for await (const event of anthropicEventsFromOpenAI(upstream.body, requestedModel)) res.write(event);
-      } else if (wire === 'gemini' && upstream.body !== null) {
+      } else if (wire === 'gemini' && upstream.body !== null && typeof upstream.body.getReader === 'function') {
         // Translate Gemini SSE to Anthropic SSE via OpenAI
-        const openaiStream = (async function* () {
+        const geminiChunks = (async function* () {
           for await (const chunk of geminiEventsFromOpenAI(upstream.body, routedModelId)) yield new TextEncoder().encode(chunk);
-        })() as unknown as ReadableStream<Uint8Array>;
+        })();
+        const openaiStream = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            const { value, done } = await geminiChunks.next();
+            if (done) controller.close();
+            else controller.enqueue(value);
+          },
+          async cancel() {
+            await geminiChunks.return(undefined);
+          },
+        });
         for await (const event of anthropicEventsFromOpenAI(openaiStream, requestedModel)) res.write(event);
       }
       res.end();
@@ -295,7 +317,7 @@ async function handleChatOrMessages(req: IncomingMessage, res: ServerResponse, i
     // OpenAI client
     if (isStreaming) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      if (wire === 'openai' && upstream.body !== null) {
+      if (wire === 'openai' && upstream.body !== null && typeof upstream.body.getReader === 'function') {
         const reader = upstream.body.getReader();
         try {
           for (;;) {
@@ -306,9 +328,9 @@ async function handleChatOrMessages(req: IncomingMessage, res: ServerResponse, i
         } finally {
           reader.releaseLock();
         }
-      } else if (wire === 'anthropic' && upstream.body !== null) {
+      } else if (wire === 'anthropic' && upstream.body !== null && typeof upstream.body.getReader === 'function') {
         for await (const event of anthropicEventsToOpenAIStream(upstream.body, routedModelId)) res.write(event);
-      } else if (wire === 'gemini' && upstream.body !== null) {
+      } else if (wire === 'gemini' && upstream.body !== null && typeof upstream.body.getReader === 'function') {
         for await (const event of geminiEventsFromOpenAI(upstream.body, routedModelId)) res.write(event);
       }
       res.end();

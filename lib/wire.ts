@@ -252,6 +252,8 @@ export function sseEvent(event: string | null, data: unknown): string {
  * usage, then message_stop. `model` is the model the client asked for, named back to it.
  */
 export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const maybeStream = upstream as unknown as { getReader?: unknown } | null;
+  if (maybeStream === null || typeof maybeStream.getReader !== 'function') throw new Error('upstream is not a readable stream');
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -709,6 +711,8 @@ export function geminiToOpenAI(body: Json, model: string): Json {
 
 /** Translate Gemini SSE stream chunks into OpenAI SSE stream chunks. */
 export async function* geminiEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const maybeStream = upstream as unknown as { getReader?: unknown } | null;
+  if (maybeStream === null || typeof maybeStream.getReader !== 'function') throw new Error('upstream is not a readable stream');
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -850,6 +854,8 @@ export function anthropicResponseToOpenAI(body: Json, model: string): Json {
 
 /** Translate Anthropic SSE stream into OpenAI SSE stream. */
 export async function* anthropicEventsToOpenAIStream(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const maybeStream = upstream as unknown as { getReader?: unknown } | null;
+  if (maybeStream === null || typeof maybeStream.getReader !== 'function') throw new Error('upstream is not a readable stream');
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
