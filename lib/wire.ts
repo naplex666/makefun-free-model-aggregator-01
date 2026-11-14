@@ -519,6 +519,16 @@ export function openAItoGeminiRequest(body: Json, _model: string): Json {
   let systemInstruction: Json | undefined = undefined;
   let systemText = '';
   const srcMessages = Array.isArray(body.messages) ? body.messages : [];
+  /** Tool-call id -> function name, from the assistant messages: a tool message only carries the
+   * call id, and Gemini's functionResponse wants the function's name, not the id. */
+  const toolNames = new Map<string, string>();
+  for (const raw of srcMessages) {
+    if (!isRecord(raw) || !Array.isArray(raw.tool_calls)) continue;
+    for (const call of raw.tool_calls) {
+      if (!isRecord(call) || !isRecord(call.function)) continue;
+      if (typeof call.id === 'string' && typeof call.function.name === 'string') toolNames.set(call.id, call.function.name);
+    }
+  }
 
   for (const raw of srcMessages) {
     if (!isRecord(raw)) continue;
@@ -595,7 +605,7 @@ export function openAItoGeminiRequest(body: Json, _model: string): Json {
         parts: [
           {
             functionResponse: {
-              name: toolCallId || 'function',
+              name: toolNames.get(toolCallId) ?? (toolCallId || 'function'),
               response: respObj,
             },
           },
@@ -617,8 +627,9 @@ export function openAItoGeminiRequest(body: Json, _model: string): Json {
   if (typeof body.top_p === 'number') generationConfig.topP = body.top_p;
   if (typeof body.max_tokens === 'number') generationConfig.maxOutputTokens = body.max_tokens;
   if (Array.isArray(body.stop) && body.stop.length > 0) generationConfig.stopSequences = body.stop;
-  if (isRecord(body.response_format) && body.response_format.type === 'json_object') {
+  if (isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema')) {
     generationConfig.responseMimeType = 'application/json';
+    if (isRecord(body.response_format.json_schema)) generationConfig.responseSchema = body.response_format.json_schema;
   }
   if (Object.keys(generationConfig).length > 0) out.generationConfig = generationConfig;
 
@@ -860,6 +871,9 @@ export async function* anthropicEventsToOpenAIStream(upstream: ReadableStream<Ui
   const decoder = new TextDecoder();
   let buffer = '';
   let inputTokens = 0;
+  /** Tool_use blocks seen in content_block_start, by Anthropic block index: their id, name, the OpenAI tool index they map to, and whether the first delta went out. */
+  const toolBlocks = new Map<number, { id: string; name: string; openaiIndex: number; started: boolean }>();
+  let nextToolIndex = 0;
 
   const sendChunk = (delta: Json, finishReason: string | null = null, usage: Json | null = null) => {
     const chunk: Json = {
@@ -893,17 +907,45 @@ export async function* anthropicEventsToOpenAIStream(upstream: ReadableStream<Ui
                 const msg = isRecord(parsed.message) ? parsed.message : {};
                 const usageObj = isRecord(msg.usage) ? msg.usage : {};
                 inputTokens = numberOrZero(usageObj.input_tokens);
+              } else if (type === 'content_block_start') {
+                // A tool_use block names the tool call; remember it so the deltas that follow carry
+                // its id, name and a stable OpenAI tool index instead of an anonymous index 0.
+                const blockIndex = typeof parsed.index === 'number' ? parsed.index : -1;
+                const block = isRecord(parsed.content_block) ? parsed.content_block : {};
+                if (blockIndex >= 0 && block.type === 'tool_use') {
+                  toolBlocks.set(blockIndex, {
+                    id: typeof block.id === 'string' && block.id !== '' ? block.id : `call_${blockIndex}`,
+                    name: typeof block.name === 'string' ? block.name : '',
+                    openaiIndex: nextToolIndex,
+                    started: false,
+                  });
+                  nextToolIndex += 1;
+                }
               } else if (type === 'content_block_delta') {
                 const deltaObj = isRecord(parsed.delta) ? parsed.delta : {};
                 if (deltaObj.type === 'text_delta' && typeof deltaObj.text === 'string') {
                   yield sendChunk({ content: deltaObj.text });
                 } else if (deltaObj.type === 'input_json_delta' && typeof deltaObj.partial_json === 'string') {
-                  yield sendChunk({ tool_calls: [{ index: 0, function: { arguments: deltaObj.partial_json } }] });
+                  const blockIndex = typeof parsed.index === 'number' ? parsed.index : -1;
+                  let block = blockIndex >= 0 ? toolBlocks.get(blockIndex) : undefined;
+                  if (block === undefined) {
+                    // No content_block_start arrived for this block: synthesize one so the delta
+                    // still carries an id and a name slot instead of vanishing into index 0.
+                    block = { id: `call_${blockIndex}`, name: '', openaiIndex: nextToolIndex, started: false };
+                    nextToolIndex += 1;
+                    if (blockIndex >= 0) toolBlocks.set(blockIndex, block);
+                  }
+                  if (!block.started) {
+                    block.started = true;
+                    yield sendChunk({ tool_calls: [{ index: block.openaiIndex, id: block.id, type: 'function', function: { name: block.name, arguments: deltaObj.partial_json } }] });
+                  } else {
+                    yield sendChunk({ tool_calls: [{ index: block.openaiIndex, function: { arguments: deltaObj.partial_json } }] });
+                  }
                 }
               } else if (type === 'message_delta') {
                 const deltaObj = isRecord(parsed.delta) ? parsed.delta : {};
                 const stopReason = typeof deltaObj.stop_reason === 'string' ? deltaObj.stop_reason : 'end_turn';
-                const mappedStop = stopReason === 'max_tokens' ? 'length' : stopReason === 'tool_use' ? 'tool_calls' : 'stop';
+                const mappedStop = stopReason === 'max_tokens' ? 'length' : stopReason === 'tool_use' ? 'tool_calls' : stopReason === 'refusal' ? 'content_filter' : 'stop';
                 const usageObj = isRecord(parsed.usage) ? parsed.usage : {};
                 const outputTokens = numberOrZero(usageObj.usage?.output_tokens ?? usageObj.output_tokens);
                 yield sendChunk({}, mappedStop, { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens });

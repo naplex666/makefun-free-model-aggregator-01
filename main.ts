@@ -78,7 +78,7 @@ interface Route {
   rating: number;
 }
 
-function getCandidateRoutes(requires: Requirement, excludeProviders: ReadonlySet<string> = new Set()): Route[] {
+function getCandidateRoutes(requires: Requirement, excludeProviders: ReadonlySet<string> = new Set(), jsonMode = false): Route[] {
   const candidates: Route[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
@@ -92,6 +92,14 @@ function getCandidateRoutes(requires: Requirement, excludeProviders: ReadonlySet
     }
   }
   candidates.sort((a, b) => {
+    // A JSON-mode request carries response_format on the OpenAI wire; a provider whose wire cannot
+    // carry it echoes that it was absent, so route such a request to a wire that can. The Anthropic
+    // wire stays a candidate (serving beats a 503) but only after every wire that can carry JSON mode.
+    if (jsonMode) {
+      const aw = a.probe.provider.wire === 'anthropic' ? 1 : 0;
+      const bw = b.probe.provider.wire === 'anthropic' ? 1 : 0;
+      if (aw !== bw) return aw - bw;
+    }
     if (b.rating !== a.rating) return b.rating - a.rating;
     if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
     return a.model.id < b.model.id ? -1 : 1;
@@ -214,7 +222,9 @@ async function callProviderAndTranslate(
 
   try {
     const upstream = await fetch(url, { method: 'POST', headers, body: JSON.stringify(upstreamBody) });
-    if (upstream.status === 402 || upstream.status === 429 || upstream.status >= 500) {
+    // Any non-2xx is a failure to fail over from: a 400/401 error body served as a success can only
+    // lose the request, while another provider on another wire may still answer it.
+    if (upstream.status < 200 || upstream.status >= 300) {
       return null;
     }
     if (body.stream === true && (upstream.body === null || typeof upstream.body.getReader !== 'function')) {
@@ -233,12 +243,15 @@ async function handleChatOrMessages(req: IncomingMessage, res: ServerResponse, i
 
   const requires = requirementsFor(body);
   const requestedModel = typeof body.model === 'string' && body.model !== '' ? body.model : 'default';
+  // An OpenAI client JSON-mode request carries response_format; the Anthropic wire cannot carry it
+  // (its provider echoes json_mode false), so keep anthropic-wire providers as a last resort.
+  const jsonMode = isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema');
 
   let successResult: { upstream: Response; wire: string; route: Route } | null = null;
   const failedThisRequest = new Set<string>();
 
   while (true) {
-    const candidates = getCandidateRoutes(requires, failedThisRequest);
+    const candidates = getCandidateRoutes(requires, failedThisRequest, jsonMode);
     if (candidates.length === 0) break;
     const route = candidates[0];
     const result = await callProviderAndTranslate(route, body, isAnthropicClient);
@@ -420,7 +433,7 @@ async function main(): void {
   const server = createServer((req, res) => {
     handle(req, res).catch((err) => {
       log(`request failed: ${(err as Error).message}`);
-      sendError(res, 'openai', 500, 'internal_error', (err as Error).message);
+      sendError(res, (req.url ?? '').startsWith('/v1/messages') ? 'anthropic' : 'openai', 500, 'internal_error', (err as Error).message);
     });
   });
   await listen(server);
